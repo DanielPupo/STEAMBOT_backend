@@ -1,6 +1,6 @@
 flask
 flask-cors
-flask-SocketIO
+flask-socketio
 google-genai
 python-dotenv
 gunicorn
