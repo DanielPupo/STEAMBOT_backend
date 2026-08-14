@@ -25,7 +25,7 @@ from google.genai import types
 
 load_dotenv()
 
-MODELO = "gemini-2.5-flash"
+MODELO = "gemini-3.7-flash"
 GENAI_KEY = os.getenv("GENAI_KEY")
 
 if not GENAI_KEY:
