@@ -1,353 +1,292 @@
 import os
+import secrets
 import sys
-from uuid import uuid4
+from collections import defaultdict, deque
+from time import monotonic
 
-# O monkey patch precisa acontecer antes dos imports que dependem
-# de concorrência/rede.
+# O monkey patch deve acontecer antes dos imports que utilizam rede.
 if sys.platform != "win32":
     try:
         from gevent import monkey
+
         monkey.patch_all()
     except ImportError:
-        print("AVISO: Gevent não está instalado.")
-
+        print("AVISO: gevent não está instalado; usando o modo disponível.")
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 from google import genai
 from google.genai import types
 
 
-# ============================================================
-# CONFIGURAÇÕES
-# ============================================================
-
 load_dotenv()
 
-MODELO = "gemini-3.7-flash"
+APP_NAME = "STEAM+ Sparky Chatbot API"
+APP_VERSION = "2.0.0"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
 GENAI_KEY = os.getenv("GENAI_KEY")
+MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "1500"))
+RATE_LIMIT_MESSAGES = int(os.getenv("RATE_LIMIT_MESSAGES", "12"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 
-if not GENAI_KEY:
-    raise RuntimeError(
-        "A variável de ambiente GENAI_KEY não foi configurada."
-    )
+DEFAULT_ORIGINS = (
+    "https://steambot-frontend.vercel.app,"
+    "http://localhost:3000,http://localhost:5500,http://127.0.0.1:5500"
+)
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",")
+    if origin.strip()
+]
 
+WELCOME_MESSAGE = (
+    "Olá! Eu sou o **Sparky**, seu copiloto de robótica e cultura maker. "
+    "Antes de começar, você é **aluno(a)** ou **professor(a)** de STEAM+?"
+)
 
-INSTRUCOES = """
-Você é o Sparky, o assistente virtual inteligente e tutor principal da plataforma STEAM+, especializada em robótica, cultura maker e educação tecnológica com kits e blocos LEGO.
+SYSTEM_INSTRUCTIONS = """
+Você é o Sparky, tutor virtual da plataforma STEAM+, especializada em robótica,
+cultura maker e educação tecnológica com kits e blocos LEGO.
 
-Sua missão é guiar ALUNOS e PROFESSORES do Ensino Fundamental II, adaptando sua abordagem de acordo com quem está interagindo.
+IDENTIFICAÇÃO DO PERFIL
+- Se a pessoa ainda não informou seu perfil, pergunte se ela é aluno(a) ou
+  professor(a) antes de orientar.
+- Se a mensagem já declarar claramente o perfil, reconheça-o e prossiga sem
+  repetir a pergunta.
 
-Antes de começar a ajudar, faça esta pergunta:
+ALUNOS
+- Use tom entusiasmado, motivador, amigável e acessível.
+- Priorize montagem, programação, lógica e robótica.
+- Incentive XP, missões, stickers e insígnias quando fizer sentido.
+- Use metáforas simples relacionadas a engrenagens, sensores, blocos e robôs.
 
-"Olá! Antes de te auxiliar, gostaria de saber, você é um Aluno(a) ou um Professor de STEAM+?"
+PROFESSORES
+- Use tom profissional, colaborativo e pedagógico.
+- Priorize gestão de turmas, metodologias ativas, planos de aula e projetos maker.
+- Explique notas e rubricas de avaliação quando solicitado.
 
-Assim que a pessoa responder, siga o atendimento de acordo com o perfil.
+ESCOPO DE CONHECIMENTO
+- Gamificação, guias de construção, desafios e gestão de equipes.
+- Engrenagens, torque, alavancas, estruturas, loops, condicionais e sensores.
+- Cultura maker, prototipagem, testes, programação em blocos e documentação.
 
---- ALUNOS ---
-
-- Tom: entusiasmado, motivador, amigável e acessível.
-- Foco: montagem, programação, lógica e robótica.
-- Incentive XP, missões, stickers e insígnias.
-- Use metáforas relacionadas a engrenagens, sensores, blocos e robôs.
-
---- PROFESSORES ---
-
-- Tom: profissional, colaborativo e pedagógico.
-- Foco: gestão de turmas, metodologias ativas, planos de aula e projetos maker.
-- Explique o sistema de notas e rubricas de avaliação quando necessário.
-
---- CONHECIMENTOS ---
-
-- Gamificação da plataforma STEAM+.
-- Guias de construção e desafios.
-- Gestão de equipes.
-- Engrenagens, torque, alavancas e estruturas.
-- Programação de blocos.
-- Loops, condicionais e sensores.
-- Cultura Maker, prototipagem, testes e documentação.
-
---- FORMATO DAS RESPOSTAS ---
-
-- Seja direto e fácil de entender.
-- Divida explicações em passos quando necessário.
-- Utilize negrito para destacar conceitos importantes.
-- Finalize sugerindo um próximo passo prático, desafio ou pergunta.
+PADRÃO DAS RESPOSTAS
+- Responda em português do Brasil, de modo direto e fácil de entender.
+- Use passos e Markdown somente quando melhorarem a leitura.
+- Destaque conceitos essenciais em negrito.
+- Não invente funcionalidades, regras ou dados específicos da plataforma.
+- Quando faltar contexto, faça uma pergunta objetiva.
+- Termine com um próximo passo prático, desafio ou pergunta relevante.
 """
 
 
-# ============================================================
-# APLICAÇÃO
-# ============================================================
-
 app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32),
+    JSON_SORT_KEYS=False,
+)
 
-app.config["SECRET_KEY"] = os.getenv(
-    "FLASK_SECRET_KEY",
-    "steam-hub-dev-key"
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+    methods=["GET", "OPTIONS"],
 )
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins="*",
-    async_mode="gevent"
+    cors_allowed_origins=ALLOWED_ORIGINS,
+    async_mode="gevent" if sys.platform != "win32" else "threading",
+    ping_interval=25,
+    ping_timeout=30,
+    logger=False,
+    engineio_logger=False,
 )
 
-
-# Cliente oficial da API Gemini
-client = genai.Client(api_key=GENAI_KEY)
-
-
-# ============================================================
-# SESSÕES DOS CHATS
-# ============================================================
-
-# Estrutura:
-# {
-#     "socket_session_id": chat_do_gemini
-# }
-#
-# Importante:
-# Isso mantém o contexto enquanto o processo do servidor estiver
-# ativo. Ainda não é um histórico permanente em banco de dados.
-
+genai_client = genai.Client(api_key=GENAI_KEY) if GENAI_KEY else None
 active_chats = {}
+message_timestamps = defaultdict(deque)
 
 
-# ============================================================
-# FUNÇÕES AUXILIARES
-# ============================================================
+def create_chat():
+    """Cria uma conversa independente no Gemini."""
+    if genai_client is None:
+        raise RuntimeError("GENAI_KEY não configurada no ambiente do servidor.")
 
-def criar_chat():
-    """
-    Cria uma nova conversa com o Gemini.
-    """
-
-    return client.chats.create(
-        model=MODELO,
-        config=types.GenerateContentConfig(
-            system_instruction=INSTRUCOES
-        )
+    return genai_client.chats.create(
+        model=GEMINI_MODEL,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTIONS),
     )
 
 
-def obter_chat():
-    """
-    Retorna o chat associado à conexão atual.
-    Cria um novo chat quando necessário.
-    """
-
-    socket_session_id = request.sid
-
-    if socket_session_id not in active_chats:
-        app.logger.info(
-            f"Criando nova conversa Gemini: {socket_session_id}"
-        )
-
-        active_chats[socket_session_id] = criar_chat()
-
-    return active_chats[socket_session_id]
+def get_chat():
+    """Obtém o chat da conexão atual ou cria um sob demanda."""
+    session_id = request.sid
+    if session_id not in active_chats:
+        app.logger.info("Criando conversa Gemini para a sessão %s", session_id)
+        active_chats[session_id] = create_chat()
+    return active_chats[session_id]
 
 
-def remover_chat():
-    """
-    Remove o chat da memória quando o usuário desconecta.
-    """
-
-    socket_session_id = request.sid
-
-    if socket_session_id in active_chats:
-        del active_chats[socket_session_id]
-
-        app.logger.info(
-            f"Conversa removida da memória: {socket_session_id}"
-        )
+def remove_session(session_id=None):
+    """Descarta contexto e controles temporários de uma sessão."""
+    target_session = session_id or request.sid
+    active_chats.pop(target_session, None)
+    message_timestamps.pop(target_session, None)
 
 
-# ============================================================
-# ROTAS HTTP
-# ============================================================
+def is_rate_limited(session_id):
+    """Aplica um limite simples por conexão para proteger a API externa."""
+    now = monotonic()
+    timestamps = message_timestamps[session_id]
+    window_start = now - RATE_LIMIT_WINDOW_SECONDS
 
-@app.route("/")
+    while timestamps and timestamps[0] < window_start:
+        timestamps.popleft()
+
+    if len(timestamps) >= RATE_LIMIT_MESSAGES:
+        return True
+
+    timestamps.append(now)
+    return False
+
+
+def validate_message(data):
+    """Normaliza o payload recebido e retorna mensagem ou descrição do erro."""
+    if not isinstance(data, dict):
+        return None, "Formato de mensagem inválido."
+
+    message = data.get("mensagem")
+    if not isinstance(message, str):
+        return None, "A mensagem deve ser um texto."
+
+    message = message.strip()
+    if not message:
+        return None, "A mensagem não pode estar vazia."
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return None, f"A mensagem deve ter até {MAX_MESSAGE_LENGTH} caracteres."
+
+    return message, None
+
+
+@app.get("/")
 def root():
-    return jsonify({
-        "plataforma": "STEAM+ Hub",
-        "assistente": "Sparky",
-        "modulo": "Robótica & Cultura Maker LEGO",
-        "status": "Operacional",
-        "servico": "STEAM+ Sparky Chatbot API"
-    })
+    return jsonify(
+        {
+            "servico": APP_NAME,
+            "versao": APP_VERSION,
+            "assistente": "Sparky",
+            "plataforma": "STEAM+ Hub",
+            "status": "operacional" if GENAI_KEY else "configuracao_incompleta",
+        }
+    )
 
 
-@app.route("/health")
+@app.get("/health")
 def health_check():
-    """
-    Endpoint simples para verificar se o backend está funcionando.
-    """
+    ready = GENAI_KEY is not None
+    return (
+        jsonify(
+            {
+                "status": "online" if ready else "degradado",
+                "ready": ready,
+                "version": APP_VERSION,
+                "model": GEMINI_MODEL,
+            }
+        ),
+        200 if ready else 503,
+    )
 
-    return jsonify({
-        "status": "online"
-    }), 200
 
+@app.errorhandler(404)
+def not_found(_error):
+    return jsonify({"erro": "Rota não encontrada."}), 404
 
-# ============================================================
-# SOCKET.IO - CONEXÃO
-# ============================================================
 
 @socketio.on("connect")
 def handle_connect():
-    try:
-        socket_session_id = request.sid
-
-        app.logger.info(
-            f"Socket conectado: {socket_session_id}"
-        )
-
-        # Não criamos o Gemini aqui.
-        # A criação acontece somente quando a primeira mensagem
-        # for enviada.
-        emit("status_conexao", {
+    app.logger.info("Socket conectado: %s", request.sid)
+    emit(
+        "status_conexao",
+        {
             "conectado": True,
-            "session_id": socket_session_id
-        })
+            "session_id": request.sid,
+            "mensagem_inicial": WELCOME_MESSAGE,
+        },
+    )
 
-    except Exception as error:
-        app.logger.exception(
-            f"Erro durante conexão Socket.IO: {error}"
-        )
-
-        emit("erro", {
-            "erro": "Não foi possível estabelecer a conexão com o Sparky."
-        })
-
-
-# ============================================================
-# SOCKET.IO - ENVIO DE MENSAGEM
-# ============================================================
 
 @socketio.on("enviar_mensagem")
-def handle_enviar_mensagem(data):
+def handle_send_message(data):
+    message, validation_error = validate_message(data)
+    if validation_error:
+        emit("erro", {"erro": validation_error})
+        return
+
+    if is_rate_limited(request.sid):
+        emit(
+            "erro",
+            {
+                "erro": (
+                    "Muitas mensagens em pouco tempo. Aguarde alguns segundos "
+                    "antes de tentar novamente."
+                )
+            },
+        )
+        return
+
+    emit("status_bot", {"status": "processando"})
+    app.logger.info(
+        "Mensagem recebida da sessão %s (%d caracteres)", request.sid, len(message)
+    )
+
     try:
-        # --------------------------------------------------------
-        # Validação
-        # --------------------------------------------------------
+        response = get_chat().send_message(message)
+        response_text = getattr(response, "text", None)
+        if not isinstance(response_text, str) or not response_text.strip():
+            raise RuntimeError("O provedor retornou uma resposta vazia.")
 
-        if not isinstance(data, dict):
-            emit("erro", {
-                "erro": "Formato de mensagem inválido."
-            })
-            return
-
-        mensagem_usuario = str(
-            data.get("mensagem", "")
-        ).strip()
-
-        if not mensagem_usuario:
-            emit("erro", {
-                "erro": "A mensagem não pode ser vazia."
-            })
-            return
-
-        # --------------------------------------------------------
-        # Obtém/cria a conversa
-        # --------------------------------------------------------
-
-        user_chat = obter_chat()
-
-        # --------------------------------------------------------
-        # Informa ao frontend que o bot está processando
-        # --------------------------------------------------------
-
-        emit("status_bot", {
-            "status": "processando"
-        })
-
-        app.logger.info(
-            f"Mensagem recebida de {request.sid}: "
-            f"{mensagem_usuario[:100]}"
+        emit(
+            "nova_mensagem",
+            {
+                "remetente": "bot",
+                "texto": response_text.strip(),
+                "session_id": request.sid,
+            },
         )
-
-        # --------------------------------------------------------
-        # Envia para o Gemini
-        # --------------------------------------------------------
-
-        resposta_gemini = user_chat.send_message(
-            mensagem_usuario
-        )
-
-        # --------------------------------------------------------
-        # Validação da resposta
-        # --------------------------------------------------------
-
-        resposta_texto = getattr(
-            resposta_gemini,
-            "text",
-            None
-        )
-
-        if not resposta_texto:
-            raise RuntimeError(
-                "O Gemini retornou uma resposta vazia."
-            )
-
-        # --------------------------------------------------------
-        # Envia resposta para o frontend
-        # --------------------------------------------------------
-
-        emit("nova_mensagem", {
-            "remetente": "bot",
-            "texto": resposta_texto,
-            "session_id": request.sid
-        })
-
-        emit("status_bot", {
-            "status": "concluido"
-        })
-
-        app.logger.info(
-            f"Resposta enviada com sucesso para {request.sid}"
-        )
-
+        app.logger.info("Resposta enviada para a sessão %s", request.sid)
     except Exception as error:
-        # Este log é MUITO importante para descobrirmos
-        # o verdadeiro motivo caso o Gemini falhe.
-        app.logger.exception(
-            f"Erro ao processar mensagem: {error}"
+        app.logger.exception("Falha ao responder à sessão %s: %s", request.sid, error)
+        emit(
+            "erro",
+            {
+                "erro": (
+                    "Não foi possível gerar a resposta agora. "
+                    "Tente novamente em alguns instantes."
+                )
+            },
         )
-
-        emit("status_bot", {
-            "status": "concluido"
-        })
-
-        emit("erro", {
-            "erro": (
-                "Não foi possível processar sua mensagem. "
-                "Verifique o servidor e tente novamente."
-            )
-        })
+    finally:
+        emit("status_bot", {"status": "concluido"})
 
 
-# ============================================================
-# SOCKET.IO - DESCONEXÃO
-# ============================================================
+@socketio.on("resetar_conversa")
+def handle_reset_conversation():
+    remove_session(request.sid)
+    app.logger.info("Conversa reiniciada: %s", request.sid)
+    emit("conversa_resetada", {"mensagem": WELCOME_MESSAGE})
+
 
 @socketio.on("disconnect")
 def handle_disconnect():
-    app.logger.info(
-        f"Socket desconectado: {request.sid}"
-    )
+    app.logger.info("Socket desconectado: %s", request.sid)
+    remove_session(request.sid)
 
-    remover_chat()
-
-
-# ============================================================
-# EXECUÇÃO LOCAL
-# ============================================================
 
 if __name__ == "__main__":
-    socketio.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 5000))
-    )
+    socketio.run
+    app,
+    host="0.0.0.0",
+    port=int(os.getenv("PORT", "5000")),
+    debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
