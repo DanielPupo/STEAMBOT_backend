@@ -15,13 +15,19 @@ transitório (`429` ou `5xx`), o backend tenta automaticamente os modelos de
 
 ## Eventos Socket.IO
 
-- `status_conexao`: confirma a sessão e entrega a mensagem inicial.
+- A conexão deve enviar `auth: { "role": "student" }` ou `auth: { "role": "teacher" }`.
+- `status_conexao`: confirma a sessão, o perfil normalizado e entrega a mensagem inicial.
 - `enviar_mensagem`: recebe `{ "mensagem": "..." }`.
 - `status_bot`: informa `processando` ou `concluido`.
 - `nova_mensagem`: entrega a resposta do Sparky.
 - `resetar_conversa`: descarta o contexto atual.
 - `conversa_resetada`: confirma a criação de uma conversa limpa.
 - `erro`: devolve uma mensagem segura para a interface.
+
+Valores de perfil ausentes ou desconhecidos usam `student`. O perfil controla a
+experiência do chatbot, mas não substitui a autorização da plataforma. Recursos de
+administração de turmas e alunos devem continuar protegidos pelo login e pelas permissões
+do servidor principal.
 
 ## Produção
 

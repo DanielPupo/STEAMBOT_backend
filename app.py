@@ -24,7 +24,7 @@ from google.genai import types
 load_dotenv()
 
 APP_NAME = "STEAM+ Sparky Chatbot API"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 CONFIGURED_FALLBACK_MODELS = [
     model.strip()
@@ -56,31 +56,20 @@ ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
-WELCOME_MESSAGE = (
-    "Olá! Eu sou o **Sparky**, seu copiloto de robótica e cultura maker. "
-    "Antes de começar, você é **aluno(a)** ou **professor(a)** de STEAM+?"
-)
+WELCOME_MESSAGES = {
+    "student": (
+        "Olá! Eu sou o **Sparky**, seu parceiro de missões maker. 🤖 "
+        "Escolha um desafio ou conte o que você quer construir hoje!"
+    ),
+    "teacher": (
+        "Olá! Eu sou o **Sparky**, seu assistente pedagógico STEAM+. "
+        "Posso apoiar seu planejamento, suas avaliações e a organização das turmas."
+    ),
+}
 
-SYSTEM_INSTRUCTIONS = """
+BASE_SYSTEM_INSTRUCTIONS = """
 Você é o Sparky, tutor virtual da plataforma STEAM+, especializada em robótica,
 cultura maker e educação tecnológica com kits e blocos LEGO.
-
-IDENTIFICAÇÃO DO PERFIL
-- Se a pessoa ainda não informou seu perfil, pergunte se ela é aluno(a) ou
-  professor(a) antes de orientar.
-- Se a mensagem já declarar claramente o perfil, reconheça-o e prossiga sem
-  repetir a pergunta.
-
-ALUNOS
-- Use tom entusiasmado, motivador, amigável e acessível.
-- Priorize montagem, programação, lógica e robótica.
-- Incentive XP, missões, stickers e insígnias quando fizer sentido.
-- Use metáforas simples relacionadas a engrenagens, sensores, blocos e robôs.
-
-PROFESSORES
-- Use tom profissional, colaborativo e pedagógico.
-- Priorize gestão de turmas, metodologias ativas, planos de aula e projetos maker.
-- Explique notas e rubricas de avaliação quando solicitado.
 
 ESCOPO DE CONHECIMENTO
 - Gamificação, guias de construção, desafios e gestão de equipes.
@@ -95,6 +84,40 @@ PADRÃO DAS RESPOSTAS
 - Quando faltar contexto, faça uma pergunta objetiva.
 - Termine com um próximo passo prático, desafio ou pergunta relevante.
 """
+
+PROFILE_INSTRUCTIONS = {
+    "student": """
+PERFIL AUTENTICADO: ALUNO
+- Nunca mostre atalhos, ferramentas administrativas ou opções exclusivas de professor.
+- Use tom entusiasmado, motivador, amigável e apropriado para estudantes.
+- Explique um passo de cada vez e confirme o entendimento em tarefas complexas.
+- Priorize montagem, programação, lógica, sensores e robótica.
+- Transforme conteúdos em missões curtas, perguntas, desafios e conquistas.
+- Use XP, stickers, insígnias e metáforas maker sem prejudicar a clareza.
+""",
+    "teacher": """
+PERFIL AUTENTICADO: PROFESSOR
+- Use tom profissional, claro, colaborativo e pedagógico.
+- Não use XP, missões, mascotes ou linguagem infantilizada nas respostas.
+- Priorize planejamento, metodologias ativas, rubricas, gestão de equipes e projetos maker.
+- Organize respostas em objetivos, materiais, etapas, tempo e avaliação quando aplicável.
+- Não afirme ter consultado turmas, alunos ou notas que não foram fornecidos na conversa.
+""",
+}
+
+
+def normalize_profile(role):
+    """Converte o perfil recebido pela sessão para um dos perfis suportados."""
+    normalized = str(role or "").strip().lower()
+    if normalized in {"teacher", "professor", "professora"}:
+        return "teacher"
+    return "student"
+
+
+def build_system_instructions(profile):
+    """Monta as instruções específicas do perfil autenticado."""
+    normalized_profile = normalize_profile(profile)
+    return f"{BASE_SYSTEM_INSTRUCTIONS}\n{PROFILE_INSTRUCTIONS[normalized_profile]}"
 
 
 app = Flask(__name__)
@@ -121,30 +144,42 @@ socketio = SocketIO(
 
 genai_client = genai.Client(api_key=GENAI_KEY) if GENAI_KEY else None
 active_chats = {}
+session_profiles = {}
 message_timestamps = defaultdict(deque)
 
 
-def create_chat(model):
+def create_chat(model, profile):
     """Cria uma conversa independente no modelo informado."""
     if genai_client is None:
         raise RuntimeError("GENAI_KEY não configurada no ambiente do servidor.")
 
     return genai_client.chats.create(
         model=model,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTIONS),
+        config=types.GenerateContentConfig(
+            system_instruction=build_system_instructions(profile)
+        ),
     )
 
 
 def get_chat(model):
     """Obtém o chat da sessão no modelo pedido ou cria um sob demanda."""
     session_id = request.sid
+    profile = session_profiles.get(session_id, "student")
     session_chat = active_chats.get(session_id)
 
-    if not session_chat or session_chat["model"] != model:
+    if (
+        not session_chat
+        or session_chat["model"] != model
+        or session_chat["profile"] != profile
+    ):
         app.logger.info(
             "Criando conversa Gemini para a sessão %s com %s", session_id, model
         )
-        session_chat = {"model": model, "chat": create_chat(model)}
+        session_chat = {
+            "model": model,
+            "profile": profile,
+            "chat": create_chat(model, profile),
+        }
         active_chats[session_id] = session_chat
 
     return session_chat["chat"]
@@ -190,11 +225,18 @@ def generate_response(message):
     raise last_error or RuntimeError("Nenhum modelo Gemini foi configurado.")
 
 
-def remove_session(session_id=None):
-    """Descarta contexto e controles temporários de uma sessão."""
+def clear_conversation(session_id=None):
+    """Descarta o contexto da conversa, preservando o perfil autenticado."""
     target_session = session_id or request.sid
     active_chats.pop(target_session, None)
     message_timestamps.pop(target_session, None)
+
+
+def remove_session(session_id=None):
+    """Descarta todos os dados temporários de uma sessão encerrada."""
+    target_session = session_id or request.sid
+    clear_conversation(target_session)
+    session_profiles.pop(target_session, None)
 
 
 def is_rate_limited(session_id):
@@ -267,14 +309,18 @@ def not_found(_error):
 
 
 @socketio.on("connect")
-def handle_connect():
+def handle_connect(auth=None):
+    role = auth.get("role") if isinstance(auth, dict) else None
+    profile = normalize_profile(role)
+    session_profiles[request.sid] = profile
     app.logger.info("Socket conectado: %s", request.sid)
     emit(
         "status_conexao",
         {
             "conectado": True,
             "session_id": request.sid,
-            "mensagem_inicial": WELCOME_MESSAGE,
+            "profile": profile,
+            "mensagem_inicial": WELCOME_MESSAGES[profile],
         },
     )
 
@@ -333,9 +379,13 @@ def handle_send_message(data):
 
 @socketio.on("resetar_conversa")
 def handle_reset_conversation():
-    remove_session(request.sid)
+    profile = session_profiles.get(request.sid, "student")
+    clear_conversation(request.sid)
     app.logger.info("Conversa reiniciada: %s", request.sid)
-    emit("conversa_resetada", {"mensagem": WELCOME_MESSAGE})
+    emit(
+        "conversa_resetada",
+        {"profile": profile, "mensagem": WELCOME_MESSAGES[profile]},
+    )
 
 
 @socketio.on("disconnect")

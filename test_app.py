@@ -50,6 +50,7 @@ class SparkyBackendTests(unittest.TestCase):
         app_module.app.config["TESTING"] = True
         app_module.genai_client = FakeGenAIClient()
         app_module.active_chats.clear()
+        app_module.session_profiles.clear()
         app_module.message_timestamps.clear()
         self.http_client = app_module.app.test_client()
 
@@ -86,6 +87,42 @@ class SparkyBackendTests(unittest.TestCase):
         reset_events = socket_client.get_received()
         self.assertIn("conversa_resetada", [event["name"] for event in reset_events])
         socket_client.disconnect()
+
+    def test_profile_is_bound_to_connection_and_preserved_on_reset(self):
+        teacher_client = app_module.socketio.test_client(
+            app_module.app,
+            flask_test_client=self.http_client,
+            auth={"role": "teacher"},
+        )
+        connection_event = next(
+            event
+            for event in teacher_client.get_received()
+            if event["name"] == "status_conexao"
+        )
+        self.assertEqual(connection_event["args"][0]["profile"], "teacher")
+        self.assertIn("assistente pedagógico", connection_event["args"][0]["mensagem_inicial"])
+
+        teacher_client.emit("resetar_conversa")
+        reset_event = next(
+            event
+            for event in teacher_client.get_received()
+            if event["name"] == "conversa_resetada"
+        )
+        self.assertEqual(reset_event["args"][0]["profile"], "teacher")
+        teacher_client.disconnect()
+
+        unknown_role_client = app_module.socketio.test_client(
+            app_module.app,
+            flask_test_client=self.http_client,
+            auth={"role": "admin"},
+        )
+        fallback_event = next(
+            event
+            for event in unknown_role_client.get_received()
+            if event["name"] == "status_conexao"
+        )
+        self.assertEqual(fallback_event["args"][0]["profile"], "student")
+        unknown_role_client.disconnect()
 
     def test_transient_error_uses_fallback_model(self):
         app_module.genai_client = FallbackGenAIClient()
