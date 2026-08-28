@@ -25,14 +25,21 @@ load_dotenv()
 
 APP_NAME = "STEAM+ Sparky Chatbot API"
 APP_VERSION = "2.0.0"
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-GEMINI_FALLBACK_MODELS = [
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+CONFIGURED_FALLBACK_MODELS = [
     model.strip()
-    for model in os.getenv(
-        "GEMINI_FALLBACK_MODELS", "gemini-3.6-flash,gemini-2.5-flash"
-    ).split(",")
+    for model in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",")
     if model.strip()
 ]
+GEMINI_FALLBACK_MODELS = list(
+    dict.fromkeys(
+        [
+            *CONFIGURED_FALLBACK_MODELS,
+            "gemini-3.5-flash-lite",
+            "gemini-3.6-flash",
+        ]
+    )
+)
 MODEL_CHAIN = list(dict.fromkeys([GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]))
 GENAI_KEY = os.getenv("GENAI_KEY")
 MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "1500"))
@@ -150,7 +157,7 @@ def get_error_code(error):
 
 def is_transient_provider_error(error):
     """Indica falhas nas quais trocar de modelo pode manter o serviço disponível."""
-    return get_error_code(error) in {429, 500, 502, 503, 504}
+    return get_error_code(error) in {404, 429, 500, 502, 503, 504}
 
 
 def generate_response(message):
