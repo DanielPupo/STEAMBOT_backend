@@ -9,6 +9,10 @@ API Flask + Socket.IO responsável pelas sessões de conversa do Sparky e pela i
 3. Execute `python app.py`.
 4. Verifique `GET /health`; `ready: true` indica que a integração está configurada.
 
+`GEMINI_MODEL` define o modelo principal. Quando o provedor responder com erro
+transitório (`429` ou `5xx`), o backend tenta automaticamente os modelos de
+`GEMINI_FALLBACK_MODELS`, na ordem configurada.
+
 ## Eventos Socket.IO
 
 - `status_conexao`: confirma a sessão e entrega a mensagem inicial.

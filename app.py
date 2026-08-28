@@ -25,7 +25,15 @@ load_dotenv()
 
 APP_NAME = "STEAM+ Sparky Chatbot API"
 APP_VERSION = "2.0.0"
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_FALLBACK_MODELS", "gemini-3.6-flash,gemini-2.5-flash"
+    ).split(",")
+    if model.strip()
+]
+MODEL_CHAIN = list(dict.fromkeys([GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]))
 GENAI_KEY = os.getenv("GENAI_KEY")
 MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "1500"))
 RATE_LIMIT_MESSAGES = int(os.getenv("RATE_LIMIT_MESSAGES", "12"))
@@ -109,24 +117,70 @@ active_chats = {}
 message_timestamps = defaultdict(deque)
 
 
-def create_chat():
-    """Cria uma conversa independente no Gemini."""
+def create_chat(model):
+    """Cria uma conversa independente no modelo informado."""
     if genai_client is None:
         raise RuntimeError("GENAI_KEY não configurada no ambiente do servidor.")
 
     return genai_client.chats.create(
-        model=GEMINI_MODEL,
+        model=model,
         config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTIONS),
     )
 
 
-def get_chat():
-    """Obtém o chat da conexão atual ou cria um sob demanda."""
+def get_chat(model):
+    """Obtém o chat da sessão no modelo pedido ou cria um sob demanda."""
     session_id = request.sid
-    if session_id not in active_chats:
-        app.logger.info("Criando conversa Gemini para a sessão %s", session_id)
-        active_chats[session_id] = create_chat()
-    return active_chats[session_id]
+    session_chat = active_chats.get(session_id)
+
+    if not session_chat or session_chat["model"] != model:
+        app.logger.info(
+            "Criando conversa Gemini para a sessão %s com %s", session_id, model
+        )
+        session_chat = {"model": model, "chat": create_chat(model)}
+        active_chats[session_id] = session_chat
+
+    return session_chat["chat"]
+
+
+def get_error_code(error):
+    """Extrai o status HTTP das exceções do SDK sem depender de uma única versão."""
+    return getattr(error, "code", None) or getattr(error, "status_code", None)
+
+
+def is_transient_provider_error(error):
+    """Indica falhas nas quais trocar de modelo pode manter o serviço disponível."""
+    return get_error_code(error) in {429, 500, 502, 503, 504}
+
+
+def generate_response(message):
+    """Gera uma resposta e troca de modelo em falhas transitórias do provedor."""
+    session_chat = active_chats.get(request.sid)
+    current_model = session_chat.get("model") if session_chat else None
+    candidates = list(dict.fromkeys([current_model, *MODEL_CHAIN]))
+    candidates = [model for model in candidates if model]
+    last_error = None
+
+    for index, model in enumerate(candidates):
+        try:
+            response = get_chat(model).send_message(message)
+            response_text = getattr(response, "text", None)
+            if not isinstance(response_text, str) or not response_text.strip():
+                raise RuntimeError("O provedor retornou uma resposta vazia.")
+            return response_text.strip(), model
+        except Exception as error:
+            last_error = error
+            has_fallback = index < len(candidates) - 1
+            if not has_fallback or not is_transient_provider_error(error):
+                raise
+
+            app.logger.warning(
+                "Modelo %s indisponível (código %s); tentando o próximo modelo.",
+                model,
+                get_error_code(error),
+            )
+
+    raise last_error or RuntimeError("Nenhum modelo Gemini foi configurado.")
 
 
 def remove_session(session_id=None):
@@ -193,6 +247,7 @@ def health_check():
                 "ready": ready,
                 "version": APP_VERSION,
                 "model": GEMINI_MODEL,
+                "fallback_models": GEMINI_FALLBACK_MODELS,
             }
         ),
         200 if ready else 503,
@@ -242,10 +297,7 @@ def handle_send_message(data):
     )
 
     try:
-        response = get_chat().send_message(message)
-        response_text = getattr(response, "text", None)
-        if not isinstance(response_text, str) or not response_text.strip():
-            raise RuntimeError("O provedor retornou uma resposta vazia.")
+        response_text, model_used = generate_response(message)
 
         emit(
             "nova_mensagem",
@@ -253,6 +305,7 @@ def handle_send_message(data):
                 "remetente": "bot",
                 "texto": response_text.strip(),
                 "session_id": request.sid,
+                "model": model_used,
             },
         )
         app.logger.info("Resposta enviada para a sessão %s", request.sid)

@@ -25,6 +25,26 @@ class FakeGenAIClient:
     chats = FakeChats()
 
 
+class TransientProviderError(Exception):
+    code = 503
+
+
+class UnavailableChat:
+    def send_message(self, _message):
+        raise TransientProviderError("Modelo temporariamente indisponível")
+
+
+class FallbackChats:
+    def create(self, **kwargs):
+        if kwargs["model"] == app_module.GEMINI_MODEL:
+            return UnavailableChat()
+        return FakeChat()
+
+
+class FallbackGenAIClient:
+    chats = FallbackChats()
+
+
 class SparkyBackendTests(unittest.TestCase):
     def setUp(self):
         app_module.app.config["TESTING"] = True
@@ -65,6 +85,30 @@ class SparkyBackendTests(unittest.TestCase):
         socket_client.emit("resetar_conversa")
         reset_events = socket_client.get_received()
         self.assertIn("conversa_resetada", [event["name"] for event in reset_events])
+        socket_client.disconnect()
+
+    def test_transient_error_uses_fallback_model(self):
+        app_module.genai_client = FallbackGenAIClient()
+        socket_client = app_module.socketio.test_client(
+            app_module.app,
+            flask_test_client=self.http_client,
+        )
+        socket_client.get_received()
+
+        socket_client.emit("enviar_mensagem", {"mensagem": "Sou professor."})
+        response_events = socket_client.get_received()
+        response_event = next(
+            event for event in response_events if event["name"] == "nova_mensagem"
+        )
+
+        self.assertEqual(
+            response_event["args"][0]["model"],
+            next(
+                model
+                for model in app_module.GEMINI_FALLBACK_MODELS
+                if model != app_module.GEMINI_MODEL
+            ),
+        )
         socket_client.disconnect()
 
 
