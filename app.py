@@ -595,14 +595,41 @@ def handle_connect(auth=None):
 
 @socketio.on("definir_perfil")
 def handle_set_profile(data):
-    """Atualiza o perfil de experiência e reinicia o contexto da IA."""
+    """Define o perfil uma única vez por conexão.
+
+    O perfil normalmente já chega no evento ``connect`` pelo objeto ``auth``.
+    Este evento existe apenas como compatibilidade. Se a sessão já possuir um
+    perfil válido, qualquer tentativa de troca é recusada no servidor.
+    """
+    profile = profile_for_session()
+    current_role = profile.get("role")
+
+    if current_role in VALID_ROLES:
+        app.logger.warning(
+            "Tentativa de alterar perfil bloqueada | sessão=%s | perfil=%s",
+            request.sid,
+            current_role,
+        )
+        emit_error(
+            (
+                "O perfil não pode ser alterado durante uma sessão ativa. "
+                "Desconecte e inicie uma nova sessão para trocar de perfil."
+            ),
+            code="profile_locked",
+        )
+        return
+
     role = normalize_role(data.get("role")) if isinstance(data, dict) else None
+
     if role not in VALID_ROLES:
-        emit_error("Escolha um perfil válido: aluno ou professor.", code="invalid_profile")
+        emit_error(
+            "Escolha um perfil válido: aluno ou professor.",
+            code="invalid_profile",
+        )
         return
 
     profile = update_profile(data)
-    active_chats.pop(request.sid, None)  # evita manter instruções do perfil anterior
+    active_chats.pop(request.sid, None)
 
     emit(
         "perfil_atualizado",
