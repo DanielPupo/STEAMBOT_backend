@@ -19,6 +19,8 @@ from __future__ import annotations
 import os
 import secrets
 import sys
+import re
+import unicodedata
 from collections import defaultdict, deque
 from time import monotonic
 from typing import Any
@@ -100,6 +102,16 @@ PADRÃO DAS RESPOSTAS
 - Não invente funcionalidades, regras ou dados específicos da plataforma.
 - Quando faltar contexto, faça uma pergunta objetiva.
 - Termine com um próximo passo prático, desafio ou pergunta relevante.
+
+SEGURANÇA E ADEQUAÇÃO ETÁRIA
+
+- A plataforma é utilizada por crianças, adolescentes e professores.
+- Não produza conteúdo sexual ou adulto.
+- Não produza insultos racistas, homofóbicos ou discriminatórios.
+- Não reproduza linguagem de ódio.
+- Não incentive assédio ou discriminação.
+- Caso o usuário solicite esse tipo de conteúdo, responda apenas que o assunto
+  não é permitido na plataforma e redirecione para temas educacionais apropriados.
 """.strip()
 
 ROLE_INSTRUCTIONS = {
@@ -122,6 +134,120 @@ GENERIC_WELCOME = (
     "Olá! Eu sou o **Sparky**, seu copiloto de robótica e cultura maker. "
     "Escolha **Aluno** ou **Professor** para eu adaptar a experiência para você."
 )
+
+# -----------------------------------------------------------------------------
+# Filtro de conteúdo
+# -----------------------------------------------------------------------------
+
+STRICT_CONTENT_FILTER = True
+
+BLOCKED_PATTERNS = {
+    "discriminacao": [
+        # Termos discriminatórios/racistas/homofóbicos devem ser
+        # cadastrados aqui internamente.
+        #
+        # Evite exibi-los na interface da aplicação.
+        r"\bTERMO_BLOQUEADO_1\b",
+        r"\bTERMO_BLOQUEADO_2\b",
+        r"\bTERMO_BLOQUEADO_3\b",
+    ],
+
+    "adulto": [
+        r"\bporn(?:o|ografia|ografico|ografica)?\b",
+        r"\bnudes?\b",
+        r"\bconteudo adulto\b",
+        r"\bconteudo \+18\b",
+        r"\bmaior de 18\b",
+        r"\bsexo explicito\b",
+    ],
+
+    "assedio": [
+        r"\bassedi(?:o|ar|ando)\b",
+        r"\bexploracao sexual\b",
+    ],
+}
+
+def normalize_content_text(text: str) -> str:
+    """
+    Normaliza texto antes da análise.
+
+    - converte para minúsculas;
+    - remove acentos;
+    - reduz alguns usos simples de leetspeak;
+    - remove símbolos utilizados para tentar burlar o filtro.
+    """
+
+    if not isinstance(text, str):
+        return ""
+
+    text = text.lower()
+
+    text = unicodedata.normalize(
+        "NFKD",
+        text,
+    )
+
+    text = "".join(
+        character
+        for character in text
+        if not unicodedata.combining(character)
+    )
+
+    substitutions = {
+        "0": "o",
+        "1": "i",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "7": "t",
+        "@": "a",
+        "$": "s",
+    }
+
+    for original, replacement in substitutions.items():
+        text = text.replace(
+            original,
+            replacement,
+        )
+
+    # "p.o.r.n.o" → "p o r n o"
+    text = re.sub(
+        r"[^a-z0-9\s]",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+def detect_blocked_content(
+    text: str,
+) -> tuple[bool, str | None]:
+
+    if not STRICT_CONTENT_FILTER:
+        return False, None
+
+    normalized_text = normalize_content_text(
+        text
+    )
+
+    for category, patterns in BLOCKED_PATTERNS.items():
+
+        for pattern in patterns:
+
+            if re.search(
+                pattern,
+                normalized_text,
+                flags=re.IGNORECASE,
+            ):
+                return True, category
+
+    return False, None
 
 # -----------------------------------------------------------------------------
 # App e estado temporário
@@ -494,6 +620,29 @@ def handle_send_message(data):
         emit_error(validation_error, request_id, "validation_error")
         return
 
+    blocked, category = detect_blocked_content(
+        message
+    )
+
+    if blocked:
+
+        app.logger.warning(
+            "Mensagem bloqueada | sessão=%s | categoria=%s",
+            request.sid,
+            category,
+        )
+
+        emit_error(
+            (
+                "Essa mensagem contém conteúdo não permitido "
+                "nesta plataforma educacional."
+            ),
+            request_id,
+            "blocked_content",
+        )
+
+        return
+    
     if is_rate_limited(request.sid):
         emit_error(
             "Muitas mensagens em pouco tempo. Aguarde alguns segundos antes de tentar novamente.",
@@ -512,6 +661,30 @@ def handle_send_message(data):
 
     try:
         response_text, model_used = generate_response(message or "")
+        
+        response_blocked, response_category = detect_blocked_content(
+            response_text
+        )
+        
+        if response_blocked:
+
+            app.logger.warning(
+                "Resposta da IA bloqueada | sessão=%s | categoria=%s",
+                request.sid,
+                response_category,
+            )
+
+            emit_error(
+                (
+                    "O Sparky não pode apresentar esse tipo de "
+                    "conteúdo nesta plataforma educacional."
+                ),
+                request_id,
+                "blocked_ai_response",
+            )
+
+            return
+        
         emit(
             "nova_mensagem",
             {
