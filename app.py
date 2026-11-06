@@ -113,7 +113,9 @@ DEFAULT_ORIGINS = (
     "https://frontend-xi-taupe-77.vercel.app,"
     "http://localhost:3000,"
     "http://localhost:5500,"
-    "http://127.0.0.1:5500"
+    "http://127.0.0.1:5500,"
+    "http://127.0.0.1:5501,"
+    "https://astrolearn-estrutura-front-r4vy0mscz-mayaa-lves-projects.vercel.app"
 )
 
 ALLOWED_ORIGINS = [
